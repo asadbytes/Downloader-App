@@ -32,6 +32,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -40,6 +41,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
+import com.asadbyte.downloaderapp.data.AppDatabase
+import com.asadbyte.downloaderapp.data.DbDownloadStatus
+import com.asadbyte.downloaderapp.data.DownloadRecord
 import com.asadbyte.downloaderapp.ui.theme.DownloaderAppTheme
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -68,6 +72,9 @@ private data class DownloadConfirmInfo(val url: String, val name: String, val ex
 @Composable
 fun DownloaderScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
+    val dao = remember { AppDatabase.getDatabase(context).downloadDao() }
+    val scope = rememberCoroutineScope()
+    var currentDownloadId by remember { mutableStateOf<Long?>(null) }
     var url by remember { mutableStateOf("https://releases.ubuntu.com/24.04.2/ubuntu-24.04.2-desktop-amd64.iso") }
     var downloadInfo by remember { mutableStateOf<DownloadInfo?>(null) }
     var overallProgress by remember { mutableFloatStateOf(0f) }
@@ -85,10 +92,17 @@ fun DownloaderScreen(modifier: Modifier = Modifier) {
     val callback = remember {
         object : DownloadProgressCallback {
             override fun onProgressUpdate(info: DownloadInfo) {
-                downloadInfo = info
-                overallProgress = if (info.totalSize > 0) {
-                    (info.downloadedSize.toFloat() / info.totalSize.toFloat()) * 100f
-                } else 0f
+                currentDownloadId?.let { id ->
+                    scope.launch(Dispatchers.IO) {
+                        val record = dao.getDownloadById(id)
+                        record?.let {
+                            it.downloadedSize = info.downloadedSize
+                            it.totalSize = info.totalSize
+                            it.status = DbDownloadStatus.DOWNLOADING // Or map from info.status
+                            dao.update(it)
+                        }
+                    }
+                }
             }
 
             override fun onChunkProgressUpdate(chunkId: Int, progress: Long) {
@@ -102,6 +116,16 @@ fun DownloaderScreen(modifier: Modifier = Modifier) {
 
             @RequiresApi(Build.VERSION_CODES.Q)
             override fun onDownloadCompleted(info: DownloadInfo) {
+                currentDownloadId?.let { id ->
+                    scope.launch(Dispatchers.IO) {
+                        val record = dao.getDownloadById(id)
+                        record?.let {
+                            it.status = DbDownloadStatus.COMPLETED
+                            it.downloadedSize = it.totalSize
+                            dao.update(it)
+                        }
+                    }
+                }
                 // This now runs on a background thread to avoid blocking the UI
                 // during the file copy operation.
                 CoroutineScope(Dispatchers.IO).launch {
@@ -161,6 +185,7 @@ fun DownloaderScreen(modifier: Modifier = Modifier) {
             Toast.makeText(context, "File name cannot be empty", Toast.LENGTH_SHORT).show()
             return
         }
+
         try {
             val appName = getAppName(context)
             val downloadDir = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), appName)
@@ -171,12 +196,30 @@ fun DownloaderScreen(modifier: Modifier = Modifier) {
             chunkProgresses = mapOf()
             errorMessage = null
 
-            downloader.startDownload(
-                url = downloadUrl,
-                filePath = downloadDir.absolutePath,
-                fileName = finalFileName, // Use the user-provided file name
-                progressCallback = callback
-            )
+            scope.launch(Dispatchers.IO) {
+                // 1. Create and insert the record first
+                val newRecord = DownloadRecord(
+                    url = downloadUrl,
+                    fileName = finalFileName,
+                    filePath = "...", // Determine this path
+                    totalSize = 0,
+                    downloadedSize = 0,
+                    status = DbDownloadStatus.PENDING
+                )
+                val id = dao.insert(newRecord)
+
+                // 2. Start the download with the new ID
+                withContext(Dispatchers.Main) {
+                    currentDownloadId = id
+                    downloader.startDownload(
+                        url = downloadUrl,
+                        filePath = downloadDir.absolutePath,
+                        fileName = finalFileName, // Use the user-provided file name
+                        progressCallback = callback
+                    )
+                }
+            }
+
             Toast.makeText(context, "Download started...", Toast.LENGTH_SHORT).show()
 
         } catch (e: Exception) {
