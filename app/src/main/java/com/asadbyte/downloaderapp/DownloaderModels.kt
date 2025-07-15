@@ -1,20 +1,12 @@
 package com.asadbyte.downloaderapp
 
 enum class DownloadStatus {
-    PENDING, DOWNLOADING, PAUSED, COMPLETED, FAILED
+    PENDING, DOWNLOADING, PAUSED, COMPLETED, FAILED, CANCELLED
 }
 
 enum class ChunkStatus {
-    PENDING, DOWNLOADING, COMPLETED, FAILED
+    PENDING, DOWNLOADING, PAUSED, COMPLETED, FAILED
 }
-
-data class ChunkInfo(
-    val id: Int,
-    val startByte: Long,
-    val endByte: Long,
-    val downloadedBytes: Long = 0L,
-    val status: ChunkStatus = ChunkStatus.PENDING
-)
 
 data class DownloadInfo(
     val url: String,
@@ -24,6 +16,14 @@ data class DownloadInfo(
     val downloadedSize: Long = 0L,
     val status: DownloadStatus = DownloadStatus.PENDING,
     val chunks: List<ChunkInfo> = emptyList()
+)
+
+data class ChunkInfo(
+    val id: Int,
+    val startByte: Long,
+    val endByte: Long,
+    val downloadedBytes: Long = 0L,
+    val status: ChunkStatus = ChunkStatus.PENDING
 )
 
 interface DownloadProgressCallback {

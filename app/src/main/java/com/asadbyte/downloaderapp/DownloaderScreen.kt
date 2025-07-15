@@ -1,5 +1,6 @@
 package com.asadbyte.downloaderapp
 
+import android.os.Environment
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -12,7 +13,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -25,6 +28,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.asadbyte.downloaderapp.ui.theme.DownloaderAppTheme
+import java.io.File
 
 @Composable
 fun DownloaderScreen(modifier: Modifier = Modifier) {
@@ -32,6 +36,7 @@ fun DownloaderScreen(modifier: Modifier = Modifier) {
     var downloadInfo by remember { mutableStateOf<DownloadInfo?>(null) }
     var overallProgress by remember { mutableFloatStateOf(0f) }
     var chunkProgresses by remember { mutableStateOf(mapOf<Int, Float>()) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
 
     val downloader = remember {
         MultiThreadDownloader(maxConcurrentDownloads = 4)
@@ -58,13 +63,33 @@ fun DownloaderScreen(modifier: Modifier = Modifier) {
             override fun onDownloadCompleted(info: DownloadInfo) {
                 downloadInfo = info
                 overallProgress = 100f
+                errorMessage = null
             }
 
             override fun onDownloadFailed(info: DownloadInfo, error: String) {
                 downloadInfo = info
-                // Handle error (show snack bar, etc.)
+                errorMessage = error
             }
         }
+    }
+
+    // Helper function to start new download
+    fun startNewDownload() {
+        val downloadDir = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "downloads")
+        downloadDir.mkdirs()
+
+        // Reset state
+        downloadInfo = null
+        overallProgress = 0f
+        chunkProgresses = mapOf()
+        errorMessage = null
+
+        downloader.startDownload(
+            url = "https://releases.ubuntu.com/24.04.2/ubuntu-24.04.2-desktop-amd64.iso",
+            filePath = downloadDir.absolutePath,
+            fileName = "ubuntu-24.04.2-desktop-amd64.iso",
+            progressCallback = callback
+        )
     }
 
     Column(
@@ -78,39 +103,71 @@ fun DownloaderScreen(modifier: Modifier = Modifier) {
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            val currentStatus = downloadInfo?.status
+
             Button(
                 onClick = {
-                    val downloadDir = context.getExternalFilesDir(null)?.absolutePath ?: ""
-                    downloader.startDownload(
-                        url = "https://releases.ubuntu.com/24.04.2/ubuntu-24.04.2-desktop-amd64.iso",
-                        filePath = downloadDir,
-                        fileName = "ubuntu-24.04.2-desktop-amd64.iso",
-                        progressCallback = callback
-                    )
+                    when (currentStatus) {
+                        DownloadStatus.PAUSED -> {
+                            // Delete partial file and start fresh
+                            downloadInfo?.let { info ->
+                                File(info.filePath, info.fileName).delete()
+                            }
+                            startNewDownload()
+                        }
+                        else -> startNewDownload()
+                    }
                 },
-                enabled = downloadInfo?.status != DownloadStatus.DOWNLOADING
+                enabled = currentStatus != DownloadStatus.DOWNLOADING
             ) {
-                Text("Start Download")
+                Text(
+                    when (currentStatus) {
+                        DownloadStatus.PAUSED -> "Restart Download"
+                        DownloadStatus.COMPLETED -> "Download Again"
+                        DownloadStatus.FAILED -> "Retry Download"
+                        else -> "Start Download"
+                    }
+                )
             }
 
             Button(
                 onClick = { downloader.pauseDownload() },
-                enabled = downloadInfo?.status == DownloadStatus.DOWNLOADING
+                enabled = currentStatus == DownloadStatus.DOWNLOADING
             ) {
                 Text("Pause")
             }
 
             Button(
                 onClick = { downloader.resumeDownload() },
-                enabled = downloadInfo?.status == DownloadStatus.PAUSED
+                enabled = currentStatus == DownloadStatus.PAUSED
             ) {
                 Text("Resume")
             }
 
             Button(
-                onClick = { downloader.cancelDownload() }
+                onClick = {
+                    downloader.cancelDownload()
+                    downloadInfo?.let { info ->
+                        File(info.filePath, info.fileName).delete()
+                    }
+                },
+                enabled = currentStatus in listOf(DownloadStatus.DOWNLOADING, DownloadStatus.PAUSED)
             ) {
                 Text("Cancel")
+            }
+        }
+
+        // Error Message
+        errorMessage?.let { error ->
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+            ) {
+                Text(
+                    text = "Error: $error",
+                    modifier = Modifier.padding(16.dp),
+                    color = MaterialTheme.colorScheme.onErrorContainer
+                )
             }
         }
 
@@ -131,7 +188,7 @@ fun DownloaderScreen(modifier: Modifier = Modifier) {
 
                 downloadInfo?.let { info ->
                     Text("Status: ${info.status}")
-                    Text("Downloaded: ${info.downloadedSize} / ${info.totalSize} bytes")
+                    Text("Downloaded: ${formatBytes(info.downloadedSize)} / ${formatBytes(info.totalSize)}")
                     Text("File: ${info.fileName}")
                 }
             }
@@ -147,7 +204,9 @@ fun DownloaderScreen(modifier: Modifier = Modifier) {
                 Text("Chunk Progress")
 
                 downloadInfo?.chunks?.let { chunks ->
-                    LazyColumn {
+                    LazyColumn(
+                        modifier = Modifier.height(300.dp)
+                    ) {
                         items(chunks) { chunk ->
                             val progress = chunkProgresses[chunk.id] ?: 0f
 
@@ -166,6 +225,16 @@ fun DownloaderScreen(modifier: Modifier = Modifier) {
             }
         }
     }
+}
+
+fun formatBytes(bytes: Long): String {
+    if (bytes < 1024) return "$bytes B"
+    val kb = bytes / 1024.0
+    if (kb < 1024) return "%.1f KB".format(kb)
+    val mb = kb / 1024.0
+    if (mb < 1024) return "%.1f MB".format(mb)
+    val gb = mb / 1024.0
+    return "%.1f GB".format(gb)
 }
 
 @Preview(showBackground = true)

@@ -24,8 +24,10 @@ class ChunkDownloader(
         try {
             downloadChunk()
         } catch (e: Exception) {
-            currentChunkInfo = currentChunkInfo.copy(status = ChunkStatus.FAILED)
-            callback(currentChunkInfo)
+            if (!isPaused.get()) {
+                currentChunkInfo = currentChunkInfo.copy(status = ChunkStatus.FAILED)
+                callback(currentChunkInfo)
+            }
         } finally {
             isRunning.set(false)
         }
@@ -35,9 +37,16 @@ class ChunkDownloader(
         val connection = URL(url).openConnection() as HttpURLConnection
 
         try {
-            // Set range header for chunk download
+            // Calculate actual range to download
             val rangeStart = chunkInfo.startByte + currentChunkInfo.downloadedBytes
             val rangeEnd = chunkInfo.endByte
+
+            if (rangeStart > rangeEnd) {
+                // Chunk is already complete
+                currentChunkInfo = currentChunkInfo.copy(status = ChunkStatus.COMPLETED)
+                callback(currentChunkInfo)
+                return
+            }
 
             connection.setRequestProperty("Range", "bytes=$rangeStart-$rangeEnd")
             connection.requestMethod = "GET"
@@ -54,16 +63,18 @@ class ChunkDownloader(
             val buffer = ByteArray(8192)
             var bytesRead: Int
 
-            // Position file pointer to correct location
-            synchronized(file) {
-                file.seek(rangeStart)
-            }
-
+            // Update status to downloading
             currentChunkInfo = currentChunkInfo.copy(status = ChunkStatus.DOWNLOADING)
             callback(currentChunkInfo)
 
-            while (inputStream.read(buffer).also { bytesRead = it } != -1 && !isPaused.get()) {
+            while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                if (isPaused.get() || Thread.currentThread().isInterrupted) {
+                    break
+                }
+
+                // Write to file at correct position
                 synchronized(file) {
+                    file.seek(rangeStart + (currentChunkInfo.downloadedBytes - chunkInfo.downloadedBytes))
                     file.write(buffer, 0, bytesRead)
                 }
 
@@ -73,7 +84,10 @@ class ChunkDownloader(
                 callback(currentChunkInfo)
             }
 
-            if (!isPaused.get() && currentChunkInfo.downloadedBytes >= (chunkInfo.endByte - chunkInfo.startByte + 1)) {
+            // Check if chunk is complete
+            val expectedSize = chunkInfo.endByte - chunkInfo.startByte + 1
+            if (!isPaused.get() && !Thread.currentThread().isInterrupted &&
+                currentChunkInfo.downloadedBytes >= expectedSize) {
                 currentChunkInfo = currentChunkInfo.copy(status = ChunkStatus.COMPLETED)
                 callback(currentChunkInfo)
             }

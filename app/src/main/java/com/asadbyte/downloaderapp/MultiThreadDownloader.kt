@@ -13,8 +13,7 @@ class MultiThreadDownloader(
     private val chunkSize: Long = 2 * 1024 * 1024 // 2MB chunks
 )
 {
-
-    private val executor = ThreadPoolExecutor(
+    private var executor = ThreadPoolExecutor(
         maxConcurrentDownloads,
         maxConcurrentDownloads,
         60L,
@@ -24,7 +23,8 @@ class MultiThreadDownloader(
     )
 
     private val downloadInfo = AtomicReference<DownloadInfo>()
-    private val chunkDownloaders = mutableMapOf<Int, ChunkDownloader>()
+    private val chunkDownloaders = ConcurrentHashMap<Int, ChunkDownloader>()
+    private val activeTasks = ConcurrentHashMap<Int, Future<*>>()
     private var randomAccessFile: RandomAccessFile? = null
     private var callback: DownloadProgressCallback? = null
 
@@ -38,6 +38,9 @@ class MultiThreadDownloader(
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
+                // Cancel any existing download
+                cancelDownload()
+
                 // Check if file already exists and is complete
                 val file = File(filePath, fileName)
                 if (file.exists()) {
@@ -133,7 +136,9 @@ class MultiThreadDownloader(
                 ChunkInfo(
                     id = chunkId++,
                     startByte = currentByte,
-                    endByte = endByte
+                    endByte = endByte,
+                    downloadedBytes = 0L,
+                    status = ChunkStatus.PENDING
                 )
             )
             currentByte = endByte + 1
@@ -144,16 +149,21 @@ class MultiThreadDownloader(
 
     private fun startChunkDownloads(url: String, chunks: List<ChunkInfo>) {
         chunks.forEach { chunk ->
-            val chunkDownloader = ChunkDownloader(
-                chunkInfo = chunk,
-                url = url,
-                file = randomAccessFile!!,
-                callback = { updatedChunk -> onChunkUpdate(updatedChunk) }
-            )
-
-            chunkDownloaders[chunk.id] = chunkDownloader
-            executor.submit(chunkDownloader)
+            startChunkDownload(url, chunk)
         }
+    }
+
+    private fun startChunkDownload(url: String, chunk: ChunkInfo) {
+        val chunkDownloader = ChunkDownloader(
+            chunkInfo = chunk,
+            url = url,
+            file = randomAccessFile!!,
+            callback = { updatedChunk -> onChunkUpdate(updatedChunk) }
+        )
+
+        chunkDownloaders[chunk.id] = chunkDownloader
+        val future = executor.submit(chunkDownloader)
+        activeTasks[chunk.id] = future
     }
 
     private fun onChunkUpdate(updatedChunk: ChunkInfo) {
@@ -167,11 +177,13 @@ class MultiThreadDownloader(
         // Calculate total progress
         val totalDownloaded = updatedChunks.sumOf { it.downloadedBytes }
         val allCompleted = updatedChunks.all { it.status == ChunkStatus.COMPLETED }
+        val anyFailed = updatedChunks.any { it.status == ChunkStatus.FAILED }
 
         val newStatus = when {
             allCompleted -> DownloadStatus.COMPLETED
-            updatedChunks.any { it.status == ChunkStatus.FAILED } -> DownloadStatus.FAILED
-            else -> currentInfo.status
+            anyFailed -> DownloadStatus.FAILED
+            currentInfo.status == DownloadStatus.PAUSED -> DownloadStatus.PAUSED
+            else -> DownloadStatus.DOWNLOADING
         }
 
         val updatedInfo = currentInfo.copy(
@@ -197,51 +209,85 @@ class MultiThreadDownloader(
 
     fun pauseDownload() {
         val currentInfo = downloadInfo.get() ?: return
+        if (currentInfo.status != DownloadStatus.DOWNLOADING) return
 
+        // Pause all chunk downloaders
         chunkDownloaders.values.forEach { it.pause() }
 
-        downloadInfo.set(currentInfo.copy(status = DownloadStatus.PAUSED))
-        callback?.onProgressUpdate(downloadInfo.get()!!)
+        // Cancel all active tasks
+        activeTasks.values.forEach { it.cancel(true) }
+        activeTasks.clear()
+
+        // Update chunks to reflect paused state
+        val pausedChunks = currentInfo.chunks.map { chunk ->
+            if (chunk.status == ChunkStatus.DOWNLOADING) {
+                chunk.copy(status = ChunkStatus.PAUSED)
+            } else chunk
+        }
+
+        val pausedInfo = currentInfo.copy(
+            status = DownloadStatus.PAUSED,
+            chunks = pausedChunks
+        )
+
+        downloadInfo.set(pausedInfo)
+        callback?.onProgressUpdate(pausedInfo)
     }
 
     fun resumeDownload() {
         val currentInfo = downloadInfo.get() ?: return
+        if (currentInfo.status != DownloadStatus.PAUSED) return
 
-        if (currentInfo.status == DownloadStatus.PAUSED) {
-            chunkDownloaders.values.forEach { it.resume() }
+        // Resume all chunk downloaders
+        chunkDownloaders.values.forEach { it.resume() }
 
-            // Restart failed or incomplete chunks
-            currentInfo.chunks.forEach { chunk ->
-                if (chunk.status == ChunkStatus.FAILED ||
-                    (chunk.status == ChunkStatus.PENDING && chunk.downloadedBytes == 0L)) {
-
-                    val chunkDownloader = ChunkDownloader(
-                        chunkInfo = chunk,
-                        url = currentInfo.url,
-                        file = randomAccessFile!!,
-                        callback = { updatedChunk -> onChunkUpdate(updatedChunk) }
-                    )
-
-                    chunkDownloaders[chunk.id] = chunkDownloader
-                    executor.submit(chunkDownloader)
-                }
-            }
-
-            downloadInfo.set(currentInfo.copy(status = DownloadStatus.DOWNLOADING))
-            callback?.onProgressUpdate(downloadInfo.get()!!)
+        // Restart incomplete chunks
+        val resumedChunks = currentInfo.chunks.map { chunk ->
+            if (chunk.status == ChunkStatus.PAUSED || chunk.status == ChunkStatus.FAILED) {
+                val resumedChunk = chunk.copy(status = ChunkStatus.PENDING)
+                startChunkDownload(currentInfo.url, resumedChunk)
+                resumedChunk
+            } else chunk
         }
+
+        val resumedInfo = currentInfo.copy(
+            status = DownloadStatus.DOWNLOADING,
+            chunks = resumedChunks
+        )
+
+        downloadInfo.set(resumedInfo)
+        callback?.onProgressUpdate(resumedInfo)
     }
 
     fun cancelDownload() {
+        // Stop all chunk downloaders
         chunkDownloaders.values.forEach { it.pause() }
+        chunkDownloaders.clear()
+
+        // Cancel all active tasks
+        activeTasks.values.forEach { it.cancel(true) }
+        activeTasks.clear()
+
+        // Shutdown executor and create new one
         executor.shutdownNow()
+        executor = ThreadPoolExecutor(
+            maxConcurrentDownloads,
+            maxConcurrentDownloads,
+            60L,
+            TimeUnit.SECONDS,
+            LinkedBlockingQueue(),
+            ThreadFactory { r -> Thread(r, "DownloadThread") }
+        )
+
+        // Close file
         randomAccessFile?.close()
+        randomAccessFile = null
 
         val currentInfo = downloadInfo.get()
         if (currentInfo != null) {
-            // Delete partial file
-            File(currentInfo.filePath, currentInfo.fileName).delete()
-            downloadInfo.set(currentInfo.copy(status = DownloadStatus.FAILED))
+            val cancelledInfo = currentInfo.copy(status = DownloadStatus.CANCELLED)
+            downloadInfo.set(cancelledInfo)
+            callback?.onProgressUpdate(cancelledInfo)
         }
     }
 
