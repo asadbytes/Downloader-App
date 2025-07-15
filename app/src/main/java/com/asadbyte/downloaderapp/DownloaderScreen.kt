@@ -1,6 +1,15 @@
 package com.asadbyte.downloaderapp
 
+import android.content.ActivityNotFoundException
+import android.content.ContentValues
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
 import android.os.Environment
+import android.provider.MediaStore
+import android.widget.Toast
+import androidx.annotation.RequiresApi
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -11,11 +20,11 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -27,16 +36,41 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import com.asadbyte.downloaderapp.ui.theme.DownloaderAppTheme
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.IOException
+import java.net.URL
+
+// A helper function to get the application's name
+fun getAppName(context: Context): String {
+    return context.applicationInfo.loadLabel(context.packageManager).toString()
+}
+
+// A helper function to get the file URI safely using FileProvider
+fun getFileUri(context: Context, file: File): android.net.Uri {
+    return FileProvider.getUriForFile(
+        context,
+        "${context.packageName}.provider", // Must match the authority in AndroidManifest.xml
+        file
+    )
+}
 
 @Composable
 fun DownloaderScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
+    var url by remember { mutableStateOf("https://releases.ubuntu.com/24.04.2/ubuntu-24.04.2-desktop-amd64.iso") }
     var downloadInfo by remember { mutableStateOf<DownloadInfo?>(null) }
     var overallProgress by remember { mutableFloatStateOf(0f) }
     var chunkProgresses by remember { mutableStateOf(mapOf<Int, Float>()) }
+
+    // State for managing dialogs
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var showCompletionDialog by remember { mutableStateOf<File?>(null) }
 
     val downloader = remember {
         MultiThreadDownloader(maxConcurrentDownloads = 4)
@@ -60,44 +94,164 @@ fun DownloaderScreen(modifier: Modifier = Modifier) {
                 }
             }
 
+            @RequiresApi(Build.VERSION_CODES.Q)
             override fun onDownloadCompleted(info: DownloadInfo) {
-                downloadInfo = info
-                overallProgress = 100f
-                errorMessage = null
+                // This now runs on a background thread to avoid blocking the UI
+                // during the file copy operation.
+                CoroutineScope(Dispatchers.IO).launch {
+                    val privateFile = File(info.filePath, info.fileName)
+                    var publicFileUri: Uri? = null
+
+                    try {
+                        // Use MediaStore to copy the file to the public Downloads folder
+                        val contentValues = ContentValues().apply {
+                            put(MediaStore.MediaColumns.DISPLAY_NAME, info.fileName)
+                            put(MediaStore.MediaColumns.MIME_TYPE, context.contentResolver.getType(Uri.fromFile(privateFile)))
+                            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                        }
+
+                        val resolver = context.contentResolver
+                        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
+
+                        if (uri != null) {
+                            publicFileUri = uri
+                            resolver.openOutputStream(uri)?.use { outputStream ->
+                                privateFile.inputStream().use { inputStream ->
+                                    inputStream.copyTo(outputStream)
+                                }
+                            }
+                            // The copy is complete, we can now delete the temporary private file
+                            privateFile.delete()
+                        } else {
+                            throw IOException("Failed to create MediaStore entry.")
+                        }
+                    } catch (e: Exception) {
+                        // If copy fails, trigger the error dialog
+                        withContext(Dispatchers.Main) {
+                            errorMessage = "Failed to save file to public Downloads folder: ${e.message}"
+                        }
+                        return@launch
+                    }
+
+                    // Switch back to the main thread to update UI state and show the dialog
+                    withContext(Dispatchers.Main) {
+                        downloadInfo = info.copy(status = DownloadStatus.COMPLETED)
+                        overallProgress = 100f
+                        // Use the new public URI to create the file object for the dialog
+                        showCompletionDialog = publicFileUri?.let { File(it.path) }
+                    }
+                }
             }
 
             override fun onDownloadFailed(info: DownloadInfo, error: String) {
                 downloadInfo = info
-                errorMessage = error
+                errorMessage = error // Trigger error dialog
             }
         }
     }
 
-    // Helper function to start new download
-    fun startNewDownload() {
-        val downloadDir = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "downloads")
-        downloadDir.mkdirs()
+    fun startNewDownload(downloadUrl: String) {
+        if (downloadUrl.isBlank()) {
+            Toast.makeText(context, "Please enter a valid URL", Toast.LENGTH_SHORT).show()
+            return
+        }
 
-        // Reset state
-        downloadInfo = null
-        overallProgress = 0f
-        chunkProgresses = mapOf()
-        errorMessage = null
+        try {
+            val appName = getAppName(context)
+            // Save files in a folder named after the app
+            val downloadDir = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), appName)
+            downloadDir.mkdirs()
 
-        downloader.startDownload(
-            url = "https://releases.ubuntu.com/24.04.2/ubuntu-24.04.2-desktop-amd64.iso",
-            filePath = downloadDir.absolutePath,
-            fileName = "ubuntu-24.04.2-desktop-amd64.iso",
-            progressCallback = callback
+            // Extract filename from URL
+            val fileName = URL(downloadUrl).path.substringAfterLast('/')
+            if (fileName.isBlank()) {
+                Toast.makeText(context, "Could not determine filename from URL", Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            // Reset state
+            downloadInfo = null
+            overallProgress = 0f
+            chunkProgresses = mapOf()
+            errorMessage = null
+
+            downloader.startDownload(
+                url = downloadUrl,
+                filePath = downloadDir.absolutePath,
+                fileName = fileName,
+                progressCallback = callback
+            )
+            Toast.makeText(context, "Download started...", Toast.LENGTH_SHORT).show()
+
+        } catch (e: Exception) {
+            errorMessage = "Invalid URL or network issue: ${e.message}"
+        }
+    }
+
+    // --- Dialogs ---
+    // Alert Dialog for Download Completion
+    showCompletionDialog?.let { file ->
+        AlertDialog(
+            onDismissRequest = { showCompletionDialog = null },
+            title = { Text("Download Complete") },
+            text = { Text("File '${file.name}' has been downloaded successfully.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val uri = getFileUri(context, file)
+                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(uri, context.contentResolver.getType(uri))
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        try {
+                            context.startActivity(intent)
+                        } catch (e: ActivityNotFoundException) {
+                            Toast.makeText(context, "No app found to open this file", Toast.LENGTH_LONG).show()
+                        }
+                        showCompletionDialog = null
+                    }
+                ) {
+                    Text("Open File")
+                }
+            },
+            dismissButton = {
+                Button(onClick = { showCompletionDialog = null }) {
+                    Text("Dismiss")
+                }
+            }
         )
     }
 
+    // Alert Dialog for Errors
+    errorMessage?.let { error ->
+        AlertDialog(
+            onDismissRequest = { errorMessage = null },
+            title = { Text("Download Failed") },
+            text = { Text(error) },
+            confirmButton = {
+                Button(onClick = { errorMessage = null }) {
+                    Text("OK")
+                }
+            }
+        )
+    }
+
+    // --- UI ---
     Column(
         modifier = modifier
             .fillMaxSize()
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
+        // URL Input
+        OutlinedTextField(
+            value = url,
+            onValueChange = { url = it },
+            label = { Text("Download URL") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+        )
+
         // Download Controls
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -106,69 +260,35 @@ fun DownloaderScreen(modifier: Modifier = Modifier) {
             val currentStatus = downloadInfo?.status
 
             Button(
-                onClick = {
-                    when (currentStatus) {
-                        DownloadStatus.PAUSED -> {
-                            // Delete partial file and start fresh
-                            downloadInfo?.let { info ->
-                                File(info.filePath, info.fileName).delete()
-                            }
-                            startNewDownload()
-                        }
-                        else -> startNewDownload()
-                    }
-                },
-                enabled = currentStatus != DownloadStatus.DOWNLOADING
+                onClick = { startNewDownload(url) },
+                enabled = currentStatus != DownloadStatus.DOWNLOADING,
+                modifier = Modifier.weight(1f)
             ) {
                 Text(
                     when (currentStatus) {
-                        DownloadStatus.PAUSED -> "Restart Download"
                         DownloadStatus.COMPLETED -> "Download Again"
-                        DownloadStatus.FAILED -> "Retry Download"
-                        else -> "Start Download"
+                        else -> "Start"
                     }
                 )
-            }
-
-            Button(
-                onClick = { downloader.pauseDownload() },
-                enabled = currentStatus == DownloadStatus.DOWNLOADING
-            ) {
-                Text("Pause")
-            }
-
-            Button(
-                onClick = { downloader.resumeDownload() },
-                enabled = currentStatus == DownloadStatus.PAUSED
-            ) {
-                Text("Resume")
             }
 
             Button(
                 onClick = {
-                    downloader.cancelDownload()
-                    downloadInfo?.let { info ->
-                        File(info.filePath, info.fileName).delete()
-                    }
+                    downloader.pauseDownload()
+                    Toast.makeText(context, "Download paused", Toast.LENGTH_SHORT).show()
                 },
-                enabled = currentStatus in listOf(DownloadStatus.DOWNLOADING, DownloadStatus.PAUSED)
-            ) {
-                Text("Cancel")
-            }
-        }
+                enabled = currentStatus == DownloadStatus.DOWNLOADING,
+                modifier = Modifier.weight(1f)
+            ) { Text("Pause") }
 
-        // Error Message
-        errorMessage?.let { error ->
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
-            ) {
-                Text(
-                    text = "Error: $error",
-                    modifier = Modifier.padding(16.dp),
-                    color = MaterialTheme.colorScheme.onErrorContainer
-                )
-            }
+            Button(
+                onClick = {
+                    downloader.resumeDownload()
+                    Toast.makeText(context, "Download resumed", Toast.LENGTH_SHORT).show()
+                },
+                enabled = currentStatus == DownloadStatus.PAUSED,
+                modifier = Modifier.weight(1f)
+            ) { Text("Resume") }
         }
 
         // Overall Progress
