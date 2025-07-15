@@ -26,14 +26,17 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
@@ -60,6 +63,8 @@ fun getFileUri(context: Context, file: File): android.net.Uri {
     )
 }
 
+private data class DownloadConfirmInfo(val url: String, val name: String, val extension: String)
+
 @Composable
 fun DownloaderScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
@@ -71,6 +76,7 @@ fun DownloaderScreen(modifier: Modifier = Modifier) {
     // State for managing dialogs
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var showCompletionDialog by remember { mutableStateOf<File?>(null) }
+    var confirmInfo by remember { mutableStateOf<DownloadConfirmInfo?>(null) }
 
     val downloader = remember {
         MultiThreadDownloader(maxConcurrentDownloads = 4)
@@ -150,26 +156,16 @@ fun DownloaderScreen(modifier: Modifier = Modifier) {
         }
     }
 
-    fun startNewDownload(downloadUrl: String) {
-        if (downloadUrl.isBlank()) {
-            Toast.makeText(context, "Please enter a valid URL", Toast.LENGTH_SHORT).show()
+    fun startNewDownload(downloadUrl: String, finalFileName: String) {
+        if (finalFileName.isBlank()) {
+            Toast.makeText(context, "File name cannot be empty", Toast.LENGTH_SHORT).show()
             return
         }
-
         try {
             val appName = getAppName(context)
-            // Save files in a folder named after the app
             val downloadDir = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), appName)
             downloadDir.mkdirs()
 
-            // Extract filename from URL
-            val fileName = URL(downloadUrl).path.substringAfterLast('/')
-            if (fileName.isBlank()) {
-                Toast.makeText(context, "Could not determine filename from URL", Toast.LENGTH_SHORT).show()
-                return
-            }
-
-            // Reset state
             downloadInfo = null
             overallProgress = 0f
             chunkProgresses = mapOf()
@@ -178,17 +174,65 @@ fun DownloaderScreen(modifier: Modifier = Modifier) {
             downloader.startDownload(
                 url = downloadUrl,
                 filePath = downloadDir.absolutePath,
-                fileName = fileName,
+                fileName = finalFileName, // Use the user-provided file name
                 progressCallback = callback
             )
             Toast.makeText(context, "Download started...", Toast.LENGTH_SHORT).show()
 
         } catch (e: Exception) {
-            errorMessage = "Invalid URL or network issue: ${e.message}"
+            errorMessage = "An error occurred: ${e.message}"
         }
     }
 
+
     // --- Dialogs ---
+
+    // 1. Download Confirmation Dialog
+    confirmInfo?.let { info ->
+        var editableName by remember { mutableStateOf(info.name) }
+
+        AlertDialog(
+            onDismissRequest = { confirmInfo = null },
+            title = { Text("Confirm Download") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Enter the desired file name below.")
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        TextField(
+                            value = editableName,
+                            onValueChange = { editableName = it },
+                            label = { Text("File name") },
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (info.extension.isNotEmpty()) {
+                            Text(
+                                text = info.extension,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(start = 8.dp)
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val finalFileName = editableName + info.extension
+                        startNewDownload(info.url, finalFileName)
+                        confirmInfo = null // Close the dialog
+                    }
+                ) {
+                    Text("Download")
+                }
+            },
+            dismissButton = {
+                Button(onClick = { confirmInfo = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
     // Alert Dialog for Download Completion
     showCompletionDialog?.let { file ->
         AlertDialog(
@@ -260,7 +304,31 @@ fun DownloaderScreen(modifier: Modifier = Modifier) {
             val currentStatus = downloadInfo?.status
 
             Button(
-                onClick = { startNewDownload(url) },
+                onClick = {
+                    if (url.isBlank()) {
+                        Toast.makeText(context, "Please enter a URL", Toast.LENGTH_SHORT).show()
+                        return@Button
+                    }
+                    try {
+                        // Extract file parts and show confirmation dialog
+                        val fullFileName = URL(url).path.substringAfterLast('/')
+                        if(fullFileName.isEmpty()) {
+                            Toast.makeText(context, "Could not determine filename from URL", Toast.LENGTH_SHORT).show()
+                            return@Button
+                        }
+
+                        val fileExtension = fullFileName.substringAfterLast('.', "")
+                        val fileNameWithoutExt = fullFileName.substringBeforeLast('.')
+
+                        confirmInfo = DownloadConfirmInfo(
+                            url = url,
+                            name = fileNameWithoutExt,
+                            extension = if (fileExtension.isNotEmpty()) ".$fileExtension" else ""
+                        )
+                    } catch (e: Exception) {
+                        errorMessage = "Invalid URL provided."
+                    }
+                },
                 enabled = currentStatus != DownloadStatus.DOWNLOADING,
                 modifier = Modifier.weight(1f)
             ) {
