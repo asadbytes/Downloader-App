@@ -10,12 +10,16 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -33,6 +37,31 @@ fun HistoryScreen(
     navController: NavController // Pass NavController for navigation actions
 ) {
     val downloads by viewModel.allDownloads.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    var recordToDelete by remember { mutableStateOf<DownloadRecord?>(null) }
+
+    recordToDelete?.let { record ->
+        AlertDialog(
+            onDismissRequest = { recordToDelete = null }, // Dismiss if user clicks outside
+            title = { Text("Confirm Deletion") },
+            text = { Text("Are you sure you want to delete '${record.fileName}'? This action cannot be undone.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        viewModel.deleteDownload(context, record) // Call the delete function
+                        recordToDelete = null // Hide the dialog
+                    }
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                Button(onClick = { recordToDelete = null }) { // Hide the dialog
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -48,7 +77,7 @@ fun HistoryScreen(
                             val encodedUrl = URLEncoder.encode(record.url, StandardCharsets.UTF_8.toString())
                             navController.navigate("downloader?url=$encodedUrl")
                         }
-                        is HistoryAction.Delete -> viewModel.deleteDownload(record)
+                        is HistoryAction.Delete -> recordToDelete = record
                         is HistoryAction.Open -> viewModel.openFile(action.context, record)
                     }
                 }
@@ -57,7 +86,6 @@ fun HistoryScreen(
     }
 }
 
-// Sealed class to represent actions from the item
 sealed class HistoryAction {
     data object Retry : HistoryAction()
     data object Delete : HistoryAction()
@@ -98,7 +126,6 @@ fun DownloadHistoryItem(
                     else -> {}
                 }
 
-                // Always show delete button
                 Button(onClick = { onAction(HistoryAction.Delete) }) { Text("Delete") }
             }
         }

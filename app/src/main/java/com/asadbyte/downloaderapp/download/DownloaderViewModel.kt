@@ -77,7 +77,6 @@ class DownloaderViewModel(application: Application) : AndroidViewModel(applicati
                     // Copy file to public Downloads folder using MediaStore
                     val contentValues = ContentValues().apply {
                         put(MediaStore.MediaColumns.DISPLAY_NAME, info.fileName)
-                        //put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4") // Or detect dynamically
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                             put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
                         }

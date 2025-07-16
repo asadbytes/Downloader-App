@@ -1,5 +1,8 @@
 package com.asadbyte.downloaderapp.data
 
+import android.content.Context
+import android.net.Uri
+import android.util.Log
 import com.asadbyte.downloaderapp.download.ChunkInfo
 import com.asadbyte.downloaderapp.download.DownloadInfo
 import kotlinx.coroutines.Dispatchers
@@ -46,13 +49,29 @@ class DownloadRepository(val downloadDao: DownloadDao) {
         downloadDao.update(record)
     }
 
-    suspend fun deleteRecord(record: DownloadRecord) = withContext(Dispatchers.IO) {
+    suspend fun deleteRecord(context: Context, record: DownloadRecord) = withContext(Dispatchers.IO) {
         try {
-            val file = File(record.filePath, record.fileName)
-            if (file.exists()) {
-                file.delete()
+            // Case 1: The download is complete and has a public URI.
+            if (!record.publicFileUri.isNullOrBlank()) {
+                try {
+                    val publicUri = Uri.parse(record.publicFileUri)
+                    // Use ContentResolver to delete the file from public storage.
+                    context.contentResolver.delete(publicUri, null, null)
+                } catch (e: Exception) {
+                    // This can happen if the user deleted the file manually.
+                    Log.e("Repository", "Failed to delete public file: ${record.publicFileUri}", e)
+                }
+            } else {
+                // Case 2: The download is incomplete and exists in private storage.
+                val privateFile = File(record.filePath, record.fileName)
+                if (privateFile.exists()) {
+                    privateFile.delete()
+                } else {
+                    Log.e("Repository", "Private file does not exist: ${privateFile.absolutePath}")
+                }
             }
         } finally {
+            // After attempting to delete the file, always delete the record from the database.
             downloadDao.delete(record)
         }
     }

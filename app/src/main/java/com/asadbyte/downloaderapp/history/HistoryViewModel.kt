@@ -25,9 +25,9 @@ class HistoryViewModel(application: Application) : AndroidViewModel(application)
             initialValue = emptyList()
         )
 
-    fun deleteDownload(record: DownloadRecord) {
+    fun deleteDownload(context: Context, record: DownloadRecord) {
         viewModelScope.launch {
-            repository.deleteRecord(record)
+            repository.deleteRecord(context, record)
         }
     }
 
