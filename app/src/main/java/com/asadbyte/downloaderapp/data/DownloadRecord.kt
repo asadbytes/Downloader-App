@@ -3,7 +3,6 @@ package com.asadbyte.downloaderapp.data
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 
-// Enum for download status, easier to manage than strings
 enum class DbDownloadStatus {
     PENDING,
     DOWNLOADING,
@@ -19,9 +18,11 @@ data class DownloadRecord(
     val id: Long = 0,
     val url: String,
     val fileName: String,
-    val filePath: String, // Path on the device where the file is/was stored
+    val filePath: String,
     var totalSize: Long,
     var downloadedSize: Long,
     var status: DbDownloadStatus,
-    val timestamp: Long = System.currentTimeMillis() // To sort by date
+    var chunksJson: String,
+    var publicFileUri: String? = null,
+    val timestamp: Long = System.currentTimeMillis()
 )

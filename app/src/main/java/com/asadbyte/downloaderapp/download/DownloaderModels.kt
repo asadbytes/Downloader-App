@@ -1,13 +1,19 @@
-package com.asadbyte.downloaderapp
+package com.asadbyte.downloaderapp.download
 
+import kotlinx.serialization.Serializable
+
+
+@Serializable
 enum class DownloadStatus {
     PENDING, DOWNLOADING, PAUSED, COMPLETED, FAILED, CANCELLED
 }
 
+@Serializable
 enum class ChunkStatus {
     PENDING, DOWNLOADING, PAUSED, COMPLETED, FAILED
 }
 
+@Serializable
 data class DownloadInfo(
     val url: String,
     val fileName: String,
@@ -18,6 +24,7 @@ data class DownloadInfo(
     val chunks: List<ChunkInfo> = emptyList()
 )
 
+@Serializable
 data class ChunkInfo(
     val id: Int,
     val startByte: Long,
